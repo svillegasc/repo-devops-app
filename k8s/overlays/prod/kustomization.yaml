@@ -4,26 +4,28 @@ kind: Kustomization
 namespace: reto-app-prod
 
 resources:
-  - namespace.yaml
-  - ../../base
+- namespace.yaml
+- ../../base
 
 replicas:
-  - name: backend
-    count: 2
-  - name: frontend
-    count: 2
+- count: 2
+  name: backend
+- count: 2
+  name: frontend
 
 patches:
-  - target:
-      kind: Service
-      name: frontend
-    patch: |
-      - op: replace
-        path: /spec/ports/0/nodePort
-        value: 30081
+- patch: |
+    - op: replace
+      path: /spec/ports/0/nodePort
+      value: 30081
+  target:
+    kind: Service
+    name: frontend
 
 images:
-  - name: svillegas/reto-backend
-    newTag: 3f5dad01ff8a60670132bc53d65898aa1b3f435d
-  - name: svillegas/reto-frontend
-    newTag: 3f5dad01ff8a60670132bc53d65898aa1b3f435d
+- name: svillegas/reto-backend
+  newName: svillegas/reto-backend
+  newTag: 1f4c530a4bea458d8a99f099da117a57922dcafe
+- name: svillegas/reto-frontend
+  newName: svillegas/reto-frontend
+  newTag: 1f4c530a4bea458d8a99f099da117a57922dcafe
