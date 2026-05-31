@@ -52,7 +52,7 @@ feature/*  ──PR──▶ develop  ──PR──▶ release/*  ──PR─�
 
 ### Protección de ramas (configurar en GitHub)
 
-En **Settings → Branches** para `develop`, `main` y el patrón `release/*`:
+En **Settings → Rulesets** para `develop`, `main` y el patrón `release/*`:
 
 - ✅ **Require a pull request before merging** (sin push directo).
 - ✅ **Require status checks to pass** → seleccionar el check del pipeline de validación.
