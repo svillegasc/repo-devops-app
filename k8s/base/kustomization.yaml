@@ -1,0 +1,16 @@
+# Base común a todos los entornos. NO incluye Namespace ni `namespace:` — eso lo fija cada
+# overlay para apuntar a reto-app-staging / reto-app-prod. El tag de imagen tampoco se fija
+# aquí: cada overlay lo inyecta vía su campo `images:`.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - backend-deployment.yaml
+  - frontend-deployment.yaml
+  - backend-service.yaml
+  - frontend-service.yaml
+
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/part-of: reto-devops
