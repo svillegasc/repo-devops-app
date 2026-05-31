@@ -4,17 +4,19 @@ kind: Kustomization
 namespace: reto-app-staging
 
 resources:
-  - namespace.yaml
-  - ../../base
+- namespace.yaml
+- ../../base
 
 replicas:
-  - name: backend
-    count: 1
-  - name: frontend
-    count: 1
+- count: 1
+  name: backend
+- count: 1
+  name: frontend
 
 images:
-  - name: svillegas/reto-backend
-    newTag: 3f5dad01ff8a60670132bc53d65898aa1b3f435d
-  - name: svillegas/reto-frontend
-    newTag: 3f5dad01ff8a60670132bc53d65898aa1b3f435d
+- name: svillegas/reto-backend
+  newName: svillegas/reto-backend
+  newTag: 1f4c530a4bea458d8a99f099da117a57922dcafe
+- name: svillegas/reto-frontend
+  newName: svillegas/reto-frontend
+  newTag: 1f4c530a4bea458d8a99f099da117a57922dcafe
