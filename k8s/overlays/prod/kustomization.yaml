@@ -1,0 +1,29 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: reto-app-prod
+
+resources:
+  - namespace.yaml
+  - ../../base
+
+replicas:
+  - name: backend
+    count: 2
+  - name: frontend
+    count: 2
+
+patches:
+  - target:
+      kind: Service
+      name: frontend
+    patch: |
+      - op: replace
+        path: /spec/ports/0/nodePort
+        value: 30081
+
+images:
+  - name: svillegas/reto-backend
+    newTag: 3f5dad01ff8a60670132bc53d65898aa1b3f435d
+  - name: svillegas/reto-frontend
+    newTag: 3f5dad01ff8a60670132bc53d65898aa1b3f435d

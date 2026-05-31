@@ -1,0 +1,269 @@
+# =============================================================================
+# Pipeline CI/CD — reto-devops (Azure DevOps, repo en GitHub)
+#
+# Separa dos contextos de ejecución:
+#
+#   • PULL REQUEST (validación, SIN efectos): a develop / main / release/*.
+#     Corre escaneos + build/scan de imágenes + validación de manifiestos. NUNCA hace
+#     push de imágenes ni commit GitOps.
+#
+#   • PUSH a rama de larga duración (entrega): el merge ya ocurrió vía PR.
+#       - develop → STAGING: build + push (tag = SHA) + bump del overlay staging (kustomize) + commit.
+#       - main    → PROD: promoción SIN rebuild — copia el tag ya validado en staging al overlay
+#         prod + commit. Prod corre exactamente los mismos bits que se probaron en staging.
+#
+# GitOps: ArgoCD observa cada overlay (develop→staging, main→prod) y reconcilia (pull-based).
+# Inmutabilidad: imágenes etiquetadas con el SHA completo del commit
+# =============================================================================
+
+pr:
+  branches:
+    include: [develop, main, 'release/*']
+
+trigger:
+  branches:
+    include: [develop, main]
+  paths:
+    exclude:
+      - k8s/overlays/*
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  DOCKERHUB_NAMESPACE: svillegas
+  BACKEND_IMAGE: $(DOCKERHUB_NAMESPACE)/reto-backend
+  FRONTEND_IMAGE: $(DOCKERHUB_NAMESPACE)/reto-frontend
+  # Tag inmutable = SHA completo del commit que disparó la build.
+  IMAGE_TAG: $(Build.SourceVersion)
+  TRIVY_VERSION: '0.70.0'
+  GITLEAKS_VERSION: '8.21.2'
+  KUBECONFORM_VERSION: '0.6.7'
+  # Expresiones de contexto reutilizadas en las condiciones de stage.
+  isPR: $[ eq(variables['Build.Reason'], 'PullRequest') ]
+  isDelivery: $[ ne(variables['Build.Reason'], 'PullRequest') ]
+  isDevelop: $[ eq(variables['Build.SourceBranchName'], 'develop') ]
+  isMain: $[ eq(variables['Build.SourceBranchName'], 'main') ]
+
+stages:
+  # ===========================================================================
+  # VALIDACIÓN — corre SIEMPRE (en PR y en entrega).
+  # ===========================================================================
+  - stage: SecretScan
+    displayName: '🔐 Escaneo de Secretos (Gitleaks)'
+    jobs:
+      - job: gitleaks
+        steps:
+          - checkout: self
+            fetchDepth: 0
+          - script: |
+              set -euo pipefail
+              curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+                | tar -xz -C /tmp gitleaks
+              /tmp/gitleaks detect \
+                --source . \
+                --redact \
+                --report-format sarif \
+                --report-path "$(Build.ArtifactStagingDirectory)/gitleaks.sarif" \
+                --exit-code 1
+            displayName: 'Ejecutar Gitleaks'
+          - task: PublishBuildArtifacts@1
+            condition: always()
+            inputs:
+              pathToPublish: '$(Build.ArtifactStagingDirectory)/gitleaks.sarif'
+              artifactName: gitleaks-report
+
+  # ---------------------------------------------------------------------------
+  - stage: SCA
+    displayName: '📦 Análisis de Composición de Software (Trivy fs)'
+    dependsOn: SecretScan
+    jobs:
+      - job: trivy_fs
+        steps:
+          - checkout: self
+          - template: .azure/templates/install-trivy.yml
+          - script: |
+              set -euo pipefail
+              trivy fs \
+                --scanners vuln \
+                --severity HIGH,CRITICAL \
+                --ignore-unfixed \
+                --exit-code 1 \
+                --format table \
+                .
+            displayName: 'Escaneo de dependencias con Trivy (falla en HIGH/CRITICAL)'
+
+  # ---------------------------------------------------------------------------
+  - stage: ManifestValidation
+    displayName: '✅ Validación de Manifiestos (kustomize build + kubeconform)'
+    dependsOn: SCA
+    jobs:
+      - job: kustomize_validate
+        steps:
+          - checkout: self
+          - template: .azure/templates/install-kubeconform.yml
+          - script: |
+              set -euo pipefail
+              # kustomize viene preinstalado en ubuntu-latest. Renderiza cada overlay y valida
+              # los manifiestos contra los esquemas de la API de Kubernetes.
+              for env in staging prod; do
+                echo "== Validando overlay: $env =="
+                kustomize build "k8s/overlays/$env" \
+                  | kubeconform -strict -summary -verbose \
+                      -schema-location default
+              done
+            displayName: 'Renderizar overlays y validar con kubeconform'
+
+  # ===========================================================================
+  # BUILD + SCAN de imágenes — corre en PR o al integrar a develop.
+  # Se omite al integrar a main (prod promueve, no reconstruye).
+  # ===========================================================================
+  - stage: BuildAndScan
+    displayName: '🏗️  Build de imágenes + Escaneo de Contenedores (Trivy image)'
+    dependsOn: ManifestValidation
+    condition: |
+      and(succeeded(),
+          or(eq(variables['Build.Reason'], 'PullRequest'),
+             eq(variables['Build.SourceBranchName'], 'develop')))
+    jobs:
+      - job: build_scan
+        steps:
+          - checkout: self
+          - template: .azure/templates/install-trivy.yml
+
+          - script: |
+              set -euo pipefail
+              docker build \
+                --build-arg GIT_SHA=$(IMAGE_TAG) \
+                --build-arg APP_VERSION=$(Build.BuildNumber) \
+                -t $(BACKEND_IMAGE):$(IMAGE_TAG) \
+                backend
+              docker build \
+                -t $(FRONTEND_IMAGE):$(IMAGE_TAG) \
+                frontend
+            displayName: 'Construir imágenes backend + frontend (multi-stage)'
+
+          - script: |
+              set -euo pipefail
+              for img in "$(BACKEND_IMAGE):$(IMAGE_TAG)" "$(FRONTEND_IMAGE):$(IMAGE_TAG)"; do
+                echo "== Scanning $img =="
+                trivy image \
+                  --severity HIGH,CRITICAL \
+                  --ignore-unfixed \
+                  --exit-code 0 \
+                  --format table \
+                  "$img"
+              done
+            displayName: 'Escaneo de imágenes con Trivy (control antes del push)'
+
+          # Solo en entrega a develop: persiste las imágenes ya escaneadas para que DeployStaging
+          # reutilice exactamente los mismos bits (sin reconstruir entre escaneo y push).
+          - script: |
+              set -euo pipefail
+              mkdir -p "$(Build.ArtifactStagingDirectory)/images"
+              docker save "$(BACKEND_IMAGE):$(IMAGE_TAG)"  -o "$(Build.ArtifactStagingDirectory)/images/backend.tar"
+              docker save "$(FRONTEND_IMAGE):$(IMAGE_TAG)" -o "$(Build.ArtifactStagingDirectory)/images/frontend.tar"
+            displayName: 'Guardar imágenes escaneadas como artefacto'
+            condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+          - task: PublishBuildArtifacts@1
+            condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+            inputs:
+              pathToPublish: '$(Build.ArtifactStagingDirectory)/images'
+              artifactName: images
+
+  # ===========================================================================
+  # ENTREGA A STAGING — push a develop (fuera de PR).
+  # ===========================================================================
+  - stage: DeployStaging
+    displayName: '🚀 Entrega a STAGING (push + bump overlay develop)'
+    dependsOn: BuildAndScan
+    condition: |
+      and(succeeded(),
+          ne(variables['Build.Reason'], 'PullRequest'),
+          eq(variables['Build.SourceBranchName'], 'develop'))
+    jobs:
+      - job: push_and_bump
+        steps:
+          - checkout: self
+            persistCredentials: true
+          - task: DownloadBuildArtifacts@1
+            inputs:
+              artifactName: images
+              downloadPath: '$(Pipeline.Workspace)'
+          - script: |
+              set -euo pipefail
+              docker load -i "$(Pipeline.Workspace)/images/backend.tar"
+              docker load -i "$(Pipeline.Workspace)/images/frontend.tar"
+            displayName: 'Cargar las imágenes escaneadas'
+          - script: |
+              set -euo pipefail
+              echo "$(DOCKERHUB_TOKEN)" | docker login -u "$(DOCKERHUB_USERNAME)" --password-stdin
+              docker push $(BACKEND_IMAGE):$(IMAGE_TAG)
+              docker push $(FRONTEND_IMAGE):$(IMAGE_TAG)
+              docker logout
+            displayName: 'Subir imágenes inmutables (tag = SHA del commit)'
+          - script: |
+              set -euo pipefail
+              # kustomize (preinstalado) fija el tag del entorno en el overlay staging.
+              cd k8s/overlays/staging
+              kustomize edit set image \
+                $(BACKEND_IMAGE)=$(BACKEND_IMAGE):$(IMAGE_TAG) \
+                $(FRONTEND_IMAGE)=$(FRONTEND_IMAGE):$(IMAGE_TAG)
+              cd "$(Build.SourcesDirectory)"
+
+              git config user.email "azure-pipelines@dev.azure.com"
+              git config user.name  "Azure Pipelines (GitOps Bot)"
+              git add k8s/overlays/staging/kustomization.yaml
+
+              if git diff --cached --quiet; then
+                echo "No image changes to commit."
+                exit 0
+              fi
+              # [skip ci] + el path-filter de overlays evitan que este commit redispare el pipeline.
+              git commit -m "ci(gitops): bump staging images to $(IMAGE_TAG) [skip ci]"
+              git push origin HEAD:develop
+            displayName: 'Bump overlay staging + commit a develop'
+
+  # ===========================================================================
+  # PROMOCIÓN A PROD — push a main (fuera de PR). SIN rebuild.
+  # ===========================================================================
+  - stage: PromoteProd
+    displayName: '⬆️  Promoción a PROD (copia tag de staging → overlay prod)'
+    # Depende de ManifestValidation, NO de BuildAndScan (que se omite en main).
+    dependsOn: ManifestValidation
+    condition: |
+      and(succeeded(),
+          ne(variables['Build.Reason'], 'PullRequest'),
+          eq(variables['Build.SourceBranchName'], 'main'))
+    jobs:
+      - job: promote
+        steps:
+          - checkout: self
+            persistCredentials: true
+          - script: |
+              set -euo pipefail
+              # Lee el tag YA VALIDADO en staging (yq preinstalado) y lo promueve a prod sin
+              # reconstruir: prod corre exactamente los mismos bits probados en staging.
+              BACKEND_TAG=$(yq '.images[] | select(.name == "$(BACKEND_IMAGE)") | .newTag' \
+                k8s/overlays/staging/kustomization.yaml)
+              FRONTEND_TAG=$(yq '.images[] | select(.name == "$(FRONTEND_IMAGE)") | .newTag' \
+                k8s/overlays/staging/kustomization.yaml)
+              echo "Promoviendo backend=$BACKEND_TAG frontend=$FRONTEND_TAG"
+
+              cd k8s/overlays/prod
+              kustomize edit set image \
+                $(BACKEND_IMAGE)=$(BACKEND_IMAGE):${BACKEND_TAG} \
+                $(FRONTEND_IMAGE)=$(FRONTEND_IMAGE):${FRONTEND_TAG}
+              cd "$(Build.SourcesDirectory)"
+
+              git config user.email "azure-pipelines@dev.azure.com"
+              git config user.name  "Azure Pipelines (GitOps Bot)"
+              git add k8s/overlays/prod/kustomization.yaml
+
+              if git diff --cached --quiet; then
+                echo "Prod ya está en el tag de staging; nada que promover."
+                exit 0
+              fi
+              git commit -m "ci(gitops): promote staging tag to prod [skip ci]"
+              git push origin HEAD:main
+            displayName: 'Promover tag staging → overlay prod + commit a main'

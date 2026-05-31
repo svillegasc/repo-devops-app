@@ -1,0 +1,22 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: reto-app-staging
+
+resources:
+- namespace.yaml
+- ../../base
+
+replicas:
+- count: 1
+  name: backend
+- count: 1
+  name: frontend
+
+images:
+- name: svillegas/reto-backend
+  newName: svillegas/reto-backend
+  newTag: 1f4c530a4bea458d8a99f099da117a57922dcafe
+- name: svillegas/reto-frontend
+  newName: svillegas/reto-frontend
+  newTag: 1f4c530a4bea458d8a99f099da117a57922dcafe
