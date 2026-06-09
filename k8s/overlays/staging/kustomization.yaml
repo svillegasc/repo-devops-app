@@ -16,7 +16,7 @@ replicas:
 images:
 - name: svillegas/reto-backend
   newName: svillegas/reto-backend
-  newTag: 1f4c530a4bea458d8a99f099da117a57922dcafe
+  newTag: 815892f65e939c461d41c05607c1257dcbb740b3
 - name: svillegas/reto-frontend
   newName: svillegas/reto-frontend
-  newTag: 1f4c530a4bea458d8a99f099da117a57922dcafe
+  newTag: 815892f65e939c461d41c05607c1257dcbb740b3
